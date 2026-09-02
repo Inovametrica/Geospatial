@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using SharedTelematic.Services.RabbitMQ;
 using TG.Domain.Interfaces;
+using TG.Domain.Geofences; // Para GeofencingProcessor
 using SharedTelematic.Entities.Gps;
 using System.Text.Json.Serialization;
 
@@ -183,8 +184,16 @@ namespace TG.Domain.Services
                 await _channel.BasicCancelAsync(_consumerTag);
             }
 
-            // 2. Validar que aquí llamaremos a los procesos
-
+            // 2. Llamar al procesador para que detenga a todos sus workers (VehicleProcessors).
+            //    Esto les permite terminar de procesar los mensajes que ya tenían en cola.
+            if (_processor is GeofencingProcessor concreteProcessor)
+            {
+                await concreteProcessor.StopAllProcessorsAsync();
+            }
+            else
+            {
+                _logger.LogWarning("No se pudo realizar la parada controlada de los VehicleProcessors (Geocercas).");
+            }
 
             // 3. Llamar al método base.
             await base.StopAsync(cancellationToken);

@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run TG.Service (Debug)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      // Especifica la ruta al DLL que se genera en la compilación
+      "program": "${workspaceFolder}/TG.Service/bin/Debug/net8.0/win-x64/TG.Service.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/TG.Service",
+      "stopAtEntry": false,
+      "console": "internalConsole",
+      // Aquí especificas la configuración (Release o Debug)
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      // Estos son los argumentos que pasabas en la terminal
+      "justMyCode": true,
+      "launchSettingsProfile": null,
+      "requireExactSource": false,
+      "sourceFileMap": {
+        "/Views": "${workspaceFolder}/Views"
+      }
+    }
+  ]
+}
