@@ -75,7 +75,7 @@ namespace TG.Domain.Services
 
                 // Declarar una cola FIJA y DURADERA para la comparación de geocercas
                 var queueDeclareResult = await _channel.QueueDeclareAsync(
-                    queue: "geofencing_queue", // Nombre estático para que RabbitMQ lo recuerde
+                    queue: _rabbitMQService.GeofencingQueue, // Nombre estático para que RabbitMQ lo recuerde
                     durable: true,                       // Sobrevive a reinicios del servidor RabbitMQ
                     exclusive: false,                    // Permite que el microservicio se reconecte
                     autoDelete: false,                   // La cola NUNCA se borra sola

@@ -2,9 +2,11 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using TG.Domain.Interfaces;
+using TG.Entities.Geofences;
 using TG.Persistence.Interfaces;
 using SharedTelematic.Services.RabbitMQ;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using TG.Domain.Settings;
 using Microsoft.Extensions.Options;
 using SharedTelematic.Entities.Geofences;
@@ -16,6 +18,11 @@ namespace TG.Domain.Services
     /// </summary>
     public class GeofenceEventBatchingService : BackgroundService
     {
+        private static readonly JsonSerializerOptions _serializerOptions = new()
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            ReferenceHandler = ReferenceHandler.Preserve
+        };
         private readonly ILogger<GeofenceEventBatchingService> _logger;
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly IGeofenceEventBufferService _eventBuffer;
@@ -75,7 +82,7 @@ namespace TG.Domain.Services
 
             foreach (var ev in enrichedBatch)
             {
-                string message = JsonSerializer.Serialize(ev);
+                string message = JsonSerializer.Serialize(ev, _serializerOptions);
                 string routingKey = $"vehicle_{ev.VehicleId}";
                 await _rabbitMQService.PublishAsync(exchangeName, routingKey, message);
             }
