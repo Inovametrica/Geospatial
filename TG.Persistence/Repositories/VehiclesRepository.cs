@@ -1,6 +1,9 @@
-using Microsoft.Data.SqlClient;
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Npgsql; // Reemplaza a Microsoft.Data.SqlClient
 using SharedTelematic.Entities.Gps;
 using SharedTelematic.Entities.Vehicles;
 using TG.Persistence.Interfaces;
@@ -10,6 +13,8 @@ namespace TG.Persistence.Repositories;
 
 public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
 {
+    private readonly NpgsqlDataSource _dataSource;
+
     // DEFINICIÓN DE LA CONSULTA BASE (Optimizada y "adelgazada" para Geocercas)
     private const string _baseVehicleQuery = @"
         SELECT
@@ -20,30 +25,31 @@ public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
 
             deae.latitud, deae.longitud, deae.altitud, deae.velocidad, deae.orientacion,
             deae.ignicion, deae.odometro_acumulado, deae.segundos_motor_acumulado,
-            -- 👉 CAMBIO 2: Eliminamos contrasena, trafico_gprs_acumulado, ip_servidor y puerto_servidor
+            -- CAMBIO 2: Eliminamos contrasena, trafico_gprs_acumulado, ip_servidor y puerto_servidor
         
-            ISNULL(deae.fecha_ulitmo_paquete_utc, DATEADD(year, -1, GETUTCDATE())) AS 'fecha_ulitmo_paquete_utc',
-            ISNULL(deae.fecha_ultimo_ping, DATEADD(year, -1, GETUTCDATE())) AS 'fecha_ultimo_ping',
-            ISNULL(deae.fecha_ultima_ignicion_utc, DATEADD(year, -1, GETUTCDATE())) AS 'fecha_ultima_ignicion_utc',
+            COALESCE(deae.fecha_ulitmo_paquete_utc, NOW() AT TIME ZONE 'UTC' - INTERVAL '1 year') AS fecha_ulitmo_paquete_utc,
+            COALESCE(deae.fecha_ultimo_ping, NOW() AT TIME ZONE 'UTC' - INTERVAL '1 year') AS fecha_ultimo_ping,
+            COALESCE(deae.fecha_ultima_ignicion_utc, NOW() AT TIME ZONE 'UTC' - INTERVAL '1 year') AS fecha_ultima_ignicion_utc,
            
             -- Reconstrucción autoritativa del estado de geocercas
-            ISNULL(geofences.CurrentGeofenceKeys, '') AS CurrentGeofenceKeys
+            COALESCE(geofences.CurrentGeofenceKeys, '') AS CurrentGeofenceKeys
                        
-        FROM dbo.cat_equipos ce WITH (NOLOCK)
-        LEFT JOIN dbo.dat_estado_actual_equipos deae WITH (NOLOCK) ON ce.id_equipo = deae.id_equipo
+        FROM public.cat_equipos ce
+        LEFT JOIN public.dat_estado_actual_equipos deae ON ce.id_equipo = deae.id_equipo
         LEFT JOIN (
             SELECT 
                 deeg.id_equipo,
-                STRING_AGG(CONCAT(CAST(deeg.id_geocerca AS VARCHAR(20)), '|', cg.tipo_geocerca, '|', FORMAT(deeg.fecha_utc_entrada, 'o')), ',') AS CurrentGeofenceKeys
-            FROM dbo.dat_equipos_en_geocercas deeg WITH (NOLOCK)
-            INNER JOIN dbo.cat_geocercas cg WITH (NOLOCK) ON deeg.id_geocerca = cg.id_geocerca 
+                STRING_AGG(CONCAT(deeg.id_geocerca, '|', cg.tipo_geocerca, '|', TO_CHAR(deeg.fecha_utc_entrada, 'YYYY-MM-DD""T""HH24:MI:SS.US""Z""')), ',') AS CurrentGeofenceKeys
+            FROM public.dat_equipos_en_geocercas deeg
+            INNER JOIN public.cat_geocercas cg ON deeg.id_geocerca = cg.id_geocerca 
             GROUP BY deeg.id_equipo
         ) AS geofences ON ce.id_equipo = geofences.id_equipo
-        WHERE ce.estado > -2;
-    ";
+        WHERE ce.estado > -2";
 
-    public VehiclesRepository(IOptions<DatabaseSettings> dbSettings, ILogger<VehiclesRepository> logger) : base(dbSettings, logger)
+    public VehiclesRepository(IOptions<DatabaseSettings> dbSettings, ILogger<VehiclesRepository> logger, NpgsqlDataSource dataSource)
+        : base(dbSettings, logger)
     {
+        _dataSource = dataSource;
     }
 
     /// <summary>
@@ -57,13 +63,12 @@ public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
 
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
-            // Usamos la consulta base y agregamos el filtro
-            const string query = _baseVehicleQuery + " WHERE ce.id_equipo = @id_equipo;";
+            // Usamos la consulta base y agregamos el filtro (AND debido a que ya hay un WHERE)
+            const string query = _baseVehicleQuery + " AND ce.id_equipo = @id_equipo;";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             command.Parameters.AddWithValue("@id_equipo", vehicleId);
 
             await using var reader = await command.ExecuteReaderAsync();
@@ -94,13 +99,12 @@ public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
         var vehicles = new List<Vehicle>();
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
-            // Usamos la consulta base (sin filtro)
-            const string query = _baseVehicleQuery;
+            // Usamos la consulta base agregando el terminador
+            const string query = _baseVehicleQuery + ";";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             await using var reader = await command.ExecuteReaderAsync();
 
             while (await reader.ReadAsync())
@@ -111,15 +115,15 @@ public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "VehiclesRepository.GetAllVehiclesWithStateAsync -- Error masivo al obtener todos los vehículos para el caché. para el vehículo {VehicleId}.", VehicleId);
+            _logger.LogError(ex, "VehiclesRepository.GetAllVehiclesWithStateAsync -- Error masivo al obtener todos los vehículos para el caché.");
         }
         return vehicles;
     }
 
     /// <summary>
-    /// Método helper privado para mapear un registro de SqlDataReader a un objeto Vehicle.
+    /// Método helper privado para mapear un registro de NpgsqlDataReader a un objeto Vehicle.
     /// </summary>
-    private Vehicle MapReaderToVehicle(SqlDataReader reader)
+    private Vehicle MapReaderToVehicle(NpgsqlDataReader reader)
     {
         int ordLat = reader.GetOrdinal("latitud");
         int ordLng = reader.GetOrdinal("longitud");
@@ -160,5 +164,4 @@ public class VehiclesRepository : BaseRepository<Vehicle>, IVehiclesRepository
             // 👉 CAMBIO 4: Se eliminaron Access, Port y Server, ya que no son necesarios para este caché en RAM.
         };
     }
-
 }

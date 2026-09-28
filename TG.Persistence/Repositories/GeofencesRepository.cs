@@ -1,53 +1,86 @@
+using System;
+using System.Collections.Generic;
 using System.Data;
-using Microsoft.Data.SqlClient;
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using NetTopologySuite; // Necesario para leer WKT (Well-Known Text)
-using NetTopologySuite.IO; // Necesario para leer WKT (Well-Known Text)
+using NetTopologySuite;
+using NetTopologySuite.Geometries;
+using NetTopologySuite.IO;
+using Npgsql;
+using SharedTelematic.Entities.Geofences;
 using TG.Entities.Geofences;
 using TG.Persistence.Interfaces;
 using TG.Persistence.Settings;
-using TG.Persistence.Helpers;
-using NetTopologySuite.Geometries;
-using SharedTelematic.Entities.Geofences;
 
 namespace TG.Persistence.Repositories;
 
+/// <summary>
+/// Record que mapea exactamente con el Composite Type 'public.type_geofence_event_batch' en PostgreSQL.
+/// Sustituye al antiguo DataTable para inserciones masivas de alto rendimiento.
+/// </summary>
+public record TypeGeofenceEventBatch(
+    int temp_id,
+    long id_gps,
+    long id_equipo,
+    decimal latitud,
+    decimal longitud,
+    decimal odometro,
+    decimal velocidad,
+    decimal velocidad_maxima_kmh,
+    decimal velocidad_promedio_kmh,
+    decimal orientacion,
+    DateTime fechahora_utc,
+    DateTime fechahora_utc_recepcion,
+    int evento,
+    long id_geoespacial,
+    string nombre_geoespacial,
+    int tipo_geoespacial,
+    decimal tiempo_estancia_segundos
+);
 
 /// <summary>
 /// Repositorio para gestionar geocercas (circulares y poligonales).
+/// 
+/// OBJETIVO PRINCIPAL:
+/// Extraer las geometrías de la base de datos usando PostGIS, 
+/// inyectar eventos históricos en lote, y mantener el estado actual de los equipos dentro de las geocercas.
 /// </summary>
 public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepository
 {
     // Un lector de WKT (Well-Known Text) de NetTopologySuite.
     // Es reutilizable y seguro para hilos.
     private readonly WKTReader _wktReader;
+    private readonly NpgsqlDataSource _dataSource; // Data Source para Npgsql 8+
 
-    public GeofencesRepository(IOptions<DatabaseSettings> dbSettings, ILogger<GeofencesRepository> logger) : base(dbSettings, logger)
+    public GeofencesRepository(
+        IOptions<DatabaseSettings> dbSettings,
+        ILogger<GeofencesRepository> logger,
+        NpgsqlDataSource dataSource) : base(dbSettings, logger)
     {
+        _dataSource = dataSource;
+
         // Inicializamos el lector. SRID 4326 es el estándar para Lat/Lon.
-        // 1. Definimos nuestro modelo de precisión y SRID (4326 para Lat/Lon)
         var precisionModel = new PrecisionModel();
         int srid = 4326;
 
-        // 2. Creamos un GeometryFactory con esas especificaciones
+        // Creamos un GeometryFactory con esas especificaciones
         var geometryFactory = new GeometryFactory(precisionModel, srid);
 
-        // 3. Creamos la nueva instancia de "Servicios"
         // Esto le dice a NetTopologySuite cómo debe manejar las geometrías
         var services = new NtsGeometryServices(
-            geometryFactory.CoordinateSequenceFactory, // Arg 1: CoordinateSequenceFactory
-            geometryFactory.PrecisionModel,            // Arg 2: PrecisionModel
-            geometryFactory.SRID                       // Arg 3: int (SRID)
+            geometryFactory.CoordinateSequenceFactory,
+            geometryFactory.PrecisionModel,
+            geometryFactory.SRID
         );
 
-        // 4. Pasamos esos servicios al constructor de WKTReader
         _wktReader = new WKTReader(services);
     }
 
     /// <summary>
     /// Obtiene el detalle espacial de una geocerca específica por su ID,
-    /// incluyendo su geometría en formato nativo de NetTopologySuite y su AccountId.
+    /// incluyendo su geometría (convertida de PostGIS a WKT) y su AccountId.
     /// </summary>
     public async Task<Geofence?> GetByIdSpatialAsync(long geofenceId)
     {
@@ -55,11 +88,10 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
 
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
-            // Seleccionamos el id_cuenta para el agrupamiento en el SpatialIndexManager,
-            // y convertimos la geometría espacial de SQL Server a texto WKT.
+            // En PostgreSQL (PostGIS), usamos ST_AsText para extraer la geometría.
+            // Se elimina el 'WITH (NOLOCK)' ya que Postgres utiliza MVCC y no bloquea lecturas.
             const string query = @"
                 SELECT 
                     g.id_geocerca,
@@ -69,14 +101,14 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
                     g.latitud_centro,
                     g.longitud_centro,
                     g.radio_metros,
-                    g.geometria.ToString() AS geometria_wkt
+                    ST_AsText(g.geometria) AS geometria_wkt
                 FROM 
-                    dbo.cat_geocercas g WITH (NOLOCK)
+                    public.cat_geocercas g
                 WHERE 
                     g.id_geocerca = @geofenceId 
-                    AND g.estado = 1;"; // Solo cargamos si está activa
+                    AND g.estado = 1;";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             command.Parameters.AddWithValue("@geofenceId", geofenceId);
 
             await using var reader = await command.ExecuteReaderAsync();
@@ -86,7 +118,7 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
                 var geofence = new Geofence
                 {
                     GeofenceId = reader.GetInt64(reader.GetOrdinal("id_geocerca")),
-                    AccountId = reader.GetInt32(reader.GetOrdinal("id_cuenta")), // 👉 Crítico para el R-Tree
+                    AccountId = reader.GetInt32(reader.GetOrdinal("id_cuenta")),
                     Name = reader.GetString(reader.GetOrdinal("nombre")),
                     Type = ParseGeofenceType(reader.GetString(reader.GetOrdinal("tipo_geocerca")))
                 };
@@ -94,17 +126,17 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
                 // Procesamiento condicional según el tipo primitivo de la geocerca
                 if (geofence.Type == GeofenceType.Circulo)
                 {
-                    geofence.CenterLatitude = reader.GetDecimalAsDouble("latitud_centro");
-                    geofence.CenterLongitude = reader.GetDecimalAsDouble("longitud_centro");
-                    geofence.RadiusMeters = reader.GetInt32AsDouble("radio_metros");
+                    geofence.CenterLatitude = Convert.ToDouble(reader.GetDecimal(reader.GetOrdinal("latitud_centro")));
+                    geofence.CenterLongitude = Convert.ToDouble(reader.GetDecimal(reader.GetOrdinal("longitud_centro")));
+                    geofence.RadiusMeters = Convert.ToDouble(reader.GetInt32(reader.GetOrdinal("radio_metros")));
                 }
                 else if (geofence.Type == GeofenceType.Poligono)
                 {
-                    string wkt = reader.GetStringSafe("geometria_wkt");
+                    int wktOrdinal = reader.GetOrdinal("geometria_wkt");
+                    string? wkt = reader.IsDBNull(wktOrdinal) ? null : reader.GetString(wktOrdinal);
+
                     if (!string.IsNullOrEmpty(wkt))
                     {
-                        // Convertimos la cadena WKT proveniente de SQL Server 
-                        // en un objeto Geometry de NetTopologySuite listo para cómputo espacial.
                         geofence.Geometry = _wktReader.Read(wkt);
                     }
                 }
@@ -115,7 +147,7 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error al obtener el detalle espacial de la geocerca ID: {GeofenceId}", geofenceId);
-            throw; // Re-lanzamos para que el consumidor de configuración sepa que la operación falló
+            throw;
         }
 
         return null;
@@ -130,8 +162,7 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
         var geofences = new List<Geofence>();
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
             const string query = @"
                 SELECT 
@@ -142,13 +173,13 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
                     g.latitud_centro,
                     g.longitud_centro,
                     g.radio_metros,
-                    g.geometria.ToString() AS geometria_wkt
+                    ST_AsText(g.geometria) AS geometria_wkt
                 FROM 
-                    dbo.cat_geocercas g WITH (NOLOCK)
+                    public.cat_geocercas g
                 WHERE 
-                    g.estado = 1;"; // Solo activas
+                    g.estado = 1;";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             await using var reader = await command.ExecuteReaderAsync();
 
             while (await reader.ReadAsync())
@@ -163,13 +194,15 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
 
                 if (geofence.Type == GeofenceType.Circulo)
                 {
-                    geofence.CenterLatitude = reader.GetDecimalAsDouble("latitud_centro");
-                    geofence.CenterLongitude = reader.GetDecimalAsDouble("longitud_centro");
-                    geofence.RadiusMeters = reader.GetInt32AsDouble("radio_metros");
+                    geofence.CenterLatitude = Convert.ToDouble(reader.GetDecimal(reader.GetOrdinal("latitud_centro")));
+                    geofence.CenterLongitude = Convert.ToDouble(reader.GetDecimal(reader.GetOrdinal("longitud_centro")));
+                    geofence.RadiusMeters = Convert.ToDouble(reader.GetInt32(reader.GetOrdinal("radio_metros")));
                 }
                 else if (geofence.Type == GeofenceType.Poligono)
                 {
-                    string wkt = reader.GetStringSafe("geometria_wkt");
+                    int wktOrdinal = reader.GetOrdinal("geometria_wkt");
+                    string? wkt = reader.IsDBNull(wktOrdinal) ? null : reader.GetString(wktOrdinal);
+
                     if (!string.IsNullOrEmpty(wkt))
                     {
                         geofence.Geometry = _wktReader.Read(wkt);
@@ -187,7 +220,7 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
 
     /// <summary>
     /// Inserta un lote de eventos de geocerca en la tabla histórica de forma masiva
-    /// utilizando un Tipo de Tabla Definido por el Usuario (TVP) para un rendimiento óptimo.
+    /// utilizando un arreglo de Tipos Compuestos de PostgreSQL.
     /// </summary>
     /// <param name="eventBatch">La lista de eventos de geocerca a insertar.</param>
     /// <returns>
@@ -197,87 +230,57 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
     public async Task<Dictionary<int, long>> AddGeofenceEventBatchAsync(List<GeofenceEventData> eventBatch)
     {
         var idMap = new Dictionary<int, long>();
-        if (!eventBatch.Any())
-        {
-            return idMap;
-        }
-
-        // Crear un DataTable que coincida EXACTAMENTE con la estructura del TVP en SQL.
-        var dt = new DataTable();
-        dt.Columns.Add("TempId", typeof(int));
-        dt.Columns.Add("id_gps", typeof(long));
-        dt.Columns.Add("id_equipo", typeof(long));
-        dt.Columns.Add("latitud", typeof(decimal));
-        dt.Columns.Add("longitud", typeof(decimal));
-        dt.Columns.Add("odometro", typeof(decimal));
-        dt.Columns.Add("velocidad", typeof(decimal));
-        dt.Columns.Add("velocidad_maxima_kmh", typeof(decimal));
-        dt.Columns.Add("velocidad_promedio_kmh", typeof(decimal));
-        dt.Columns.Add("orientacion", typeof(decimal));
-        dt.Columns.Add("fechahora_utc", typeof(DateTime));
-        dt.Columns.Add("fechahora_utc_recepcion", typeof(DateTime));
-        dt.Columns.Add("evento", typeof(int));
-        dt.Columns.Add("id_geoespacial", typeof(long));
-        dt.Columns.Add("nombre_geoespacial", typeof(string));
-        dt.Columns.Add("tipo_geoespacial", typeof(int));
-        dt.Columns.Add("tiempo_estancia_segundos", typeof(decimal));
-
-        // Llenar el DataTable con los datos del lote.
-        for (int i = 0; i < eventBatch.Count; i++)
-        {
-            var ev = eventBatch[i];
-            dt.Rows.Add(
-                i, // TempId es el índice original
-                ev.GpsId,
-                ev.VehicleId,
-                (decimal)ev.Latitude,
-                (decimal)ev.Longitude,
-                (decimal)ev.Odometer,
-                (decimal)ev.Speed,
-                (decimal)ev.MaxSpeedKmh,
-                (decimal)ev.AvgSpeedKmh,
-                (decimal)ev.Orientation,
-                ev.DateTimeUtc,
-                ev.ReceptionDateTimeUtc,
-                ev.EventType,
-                ev.GeofenceKey,
-                ev.GeofenceName,
-                ev.GeofenceType,
-                (decimal)ev.DwellTimeSeconds
-
-            );
-        }
+        if (!eventBatch.Any()) return idMap;
+        // Construir la lista tipada mapeada al tipo compuesto de PostgreSQL
+        var mappedBatch = eventBatch.Select((ev, index) => new TypeGeofenceEventBatch(
+            index, // TempId es el índice original
+            ev.GpsId,
+            ev.VehicleId,
+            (decimal)ev.Latitude,
+            (decimal)ev.Longitude,
+            (decimal)ev.Odometer,
+            (decimal)ev.Speed,
+            (decimal)ev.MaxSpeedKmh,
+            (decimal)ev.AvgSpeedKmh,
+            (decimal)ev.Orientation,
+            DateTime.SpecifyKind(ev.DateTimeUtc, DateTimeKind.Utc),
+            DateTime.SpecifyKind(ev.ReceptionDateTimeUtc, DateTimeKind.Utc),
+            ev.EventType,
+            ev.GeofenceKey,
+            ev.GeofenceName,
+            ev.GeofenceType,
+            (decimal)ev.DwellTimeSeconds
+        )).ToList();
 
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.History);
-            await connection.OpenAsync();
+            // Construimos un DataSource específico para History que conozca el tipo compuesto
+            var dataSourceBuilder = new NpgsqlDataSourceBuilder(_dbSettings.History);
+            dataSourceBuilder.MapComposite<TypeGeofenceEventBatch>("public.type_geofence_event_batch");
+            await using var historyDataSource = dataSourceBuilder.Build();
 
-            const string spName = "dbo.sp_InsertGeofenceEventBatch";
+            await using var connection = await historyDataSource.OpenConnectionAsync();
 
-            await using var command = new SqlCommand(spName, connection)
+            const string sql = "SELECT out_temp_id, out_id_gps FROM public.usp_insert_geofence_event_batch(@batch);";
+
+            await using var command = new NpgsqlCommand(sql, connection);
+            command.CommandTimeout = 120;
+
+            // Declaración estricta del arreglo de tipos compuestos
+            command.Parameters.Add(new NpgsqlParameter("batch", mappedBatch)
             {
-                CommandType = CommandType.StoredProcedure,
-                CommandTimeout = 120 // Se aumenta el timeout para lotes grandes.
-            };
+                DataTypeName = "public.type_geofence_event_batch[]"
+            });
 
-            // Configurar el parámetro como un TVP.
-            var tvpParam = command.Parameters.AddWithValue("@batch", dt);
-            tvpParam.SqlDbType = SqlDbType.Structured;
-            tvpParam.TypeName = "dbo.GeofenceEventBatchType"; // Nombre exacto del TYPE en SQL.
-
-            // Ejecutar y leer el mapeo de IDs devuelto por el procedimiento.
             await using var reader = await command.ExecuteReaderAsync();
             while (await reader.ReadAsync())
             {
-                idMap.Add(reader.GetInt32(0), reader.GetInt64(1)); // Mapea TempId a id_gps
+                idMap.Add(reader.GetInt32(0), reader.GetInt64(1));
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "AddGeofenceEventBatchAsync -- Error catastrófico durante la inserción masiva de eventos de geocerca. Para vehículo {VehicleId}", VehicleId);
-            // Volvemos a lanzar la excepción para que el servicio de batching sepa que la operación falló
-            // y pueda, potencialmente, reintentar el lote.
+            _logger.LogError(ex, "AddGeofenceEventBatchAsync -- Error catastrófico durante la inserción masiva de eventos de geocerca.");
             throw;
         }
 
@@ -287,9 +290,6 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
     /// <summary>
     /// Parsea el tipo de geocerca desde cadena a enum.
     /// </summary>
-    /// <param name="type"></param>
-    /// <returns></returns>
-    /// <exception cref="ArgumentException"></exception>
     private GeofenceType ParseGeofenceType(string type) => type switch
     {
         "CIRCULO" => GeofenceType.Circulo,
@@ -298,59 +298,39 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
     };
 
     /// <summary>
-    /// Parsea el ámbito de geocerca desde cadena a enum.
-    /// </summary>
-    /// <param name="scope"></param>
-    /// <returns></returns>
-    private GeofenceScope ParseGeofenceScope(string scope) => scope switch
-    {
-        "ESPECIFICO" => GeofenceScope.Especifico,
-        "ASIGNADAS" => GeofenceScope.Asignadas,
-        "ALL" => GeofenceScope.All,
-        _ => GeofenceScope.Unknown
-    };
-
-    /// <summary>
     /// Inserta un registro de estado en la tabla 'dat_equipos_en_geocercas'.
-    /// Esta operación es llamada por el GeofencingProcessor cuando detecta una ENTRADA.
+    /// Aprovecha 'ON CONFLICT DO NOTHING' para ignorar automáticamente registros duplicados.
     /// </summary>
-    /// <param name="vehicleId">El ID del equipo</param>
-    /// <param name="geofenceId">El ID de la geocerca (de cat_geocercas)</param>
-    /// <param name="entryTimeUtc">El momento de la entrada (usualmente la fecha del paquete GPS)</param>
-    /// <returns>True si la inserción fue exitosa.</returns>
     public async Task<bool> AddVehicleToGeofenceStateAsync(long vehicleId, long geofenceId, DateTime entryTimeUtc)
     {
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
-            // Usamos 'INSERT' simple.
-            // Si ya existe (lo cual sería un error de lógica en el procesador), 
-            // la Primary Key (vehicleId, geofenceId) causará un error controlado.
-            // Usamos 'IGNORE_DUP_KEY = ON' si quisiéramos evitar el error, 
-            // pero es mejor que el procesador tenga la lógica correcta.
+            // Utilizamos ON CONFLICT DO NOTHING en lugar de atrapar la excepción
             const string query = @"
-                INSERT INTO dbo.dat_equipos_en_geocercas (id_equipo, id_geocerca, fecha_utc_entrada)
-                VALUES (@id_equipo, @id_geocerca, @fecha_utc_entrada);
+                INSERT INTO public.dat_equipos_en_geocercas (id_equipo, id_geocerca, fecha_utc_entrada)
+                VALUES (@id_equipo, @id_geocerca, @fecha_utc_entrada)
+                ON CONFLICT (id_equipo, id_geocerca) DO NOTHING;
             ";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             command.Parameters.AddWithValue("@id_equipo", vehicleId);
             command.Parameters.AddWithValue("@id_geocerca", geofenceId);
-            command.Parameters.AddWithValue("@fecha_utc_entrada", entryTimeUtc);
+            command.Parameters.AddWithValue("@fecha_utc_entrada", DateTime.SpecifyKind(entryTimeUtc, DateTimeKind.Utc));
 
             int rowsAffected = await command.ExecuteNonQueryAsync();
-            return rowsAffected > 0;
+
+            if (rowsAffected == 0)
+            {
+                _logger.LogWarning("GeofencesRepository.AddVehicleToGeofenceStateAsync -- Intento de inserción duplicada (VehicleId: {VId}, GeofenceId: {GId}). El estado ya existía.", vehicleId, geofenceId);
+                return false;
+            }
+
+            return true;
         }
         catch (Exception ex)
         {
-            // El error 2627 es violación de Primary Key (ya existe). Podemos ignorarlo si es necesario.
-            if (ex.Message.Contains("Violation of PRIMARY KEY constraint"))
-            {
-                _logger.LogWarning("GeofencesRepository.AddVehicleToGeofenceStateAsync -- Intento de inserción duplicada (VehicleId: {VId}, GeofenceId: {GId}). El estado ya existía.", vehicleId, geofenceId);
-                return false; // No fue una nueva inserción
-            }
             _logger.LogError(ex, "Error en GeofencesRepository.AddVehicleToGeofenceStateAsync (VId: {VId}, GId: {GId})", vehicleId, geofenceId);
             return false;
         }
@@ -360,22 +340,18 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
     /// Elimina un registro de estado de 'dat_equipos_en_geocercas'.
     /// Esta operación es llamada por el GeofencingProcessor cuando detecta una SALIDA.
     /// </summary>
-    /// <param name="vehicleId">El ID del equipo</param>
-    /// <param name="geofenceId">El ID de la geocerca (de cat_geocercas)</param>
-    /// <returns>True si la eliminación fue exitosa.</returns>
     public async Task<bool> RemoveVehicleFromGeofenceStateAsync(long vehicleId, long geofenceId)
     {
         try
         {
-            await using var connection = new SqlConnection(_dbSettings.Telematic);
-            await connection.OpenAsync();
+            await using var connection = await _dataSource.OpenConnectionAsync();
 
             const string query = @"
-                DELETE FROM dbo.dat_equipos_en_geocercas 
+                DELETE FROM public.dat_equipos_en_geocercas 
                 WHERE id_equipo = @id_equipo AND id_geocerca = @id_geocerca;
             ";
 
-            await using var command = new SqlCommand(query, connection);
+            await using var command = new NpgsqlCommand(query, connection);
             command.Parameters.AddWithValue("@id_equipo", vehicleId);
             command.Parameters.AddWithValue("@id_geocerca", geofenceId);
 
@@ -388,5 +364,4 @@ public class GeofencesRepository : BaseRepository<Geofence>, IGeofencesRepositor
             return false;
         }
     }
-
 }

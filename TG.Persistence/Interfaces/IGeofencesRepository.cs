@@ -1,5 +1,8 @@
 using SharedTelematic.Entities.Geofences;
+using SharedTelematic.Entities.Gps;
+using SharedTelematic.Entities.Vehicles;
 using TG.Entities.Geofences;
+using TG.Entities.Interfaces;
 
 namespace TG.Persistence.Interfaces;
 

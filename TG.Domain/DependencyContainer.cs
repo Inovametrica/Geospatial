@@ -25,6 +25,17 @@ namespace TG.Domain
             // Registra la configuración para las cadenas de conexión
             services.Configure<DatabaseSettings>(configuration.GetSection("ConnectionStrings"));
 
+            // Extraemos la cadena específica usando el método de extensión GetConnectionString
+            var connectionString = configuration.GetConnectionString("Telematic")
+                ?? throw new InvalidOperationException("La cadena de conexión 'Telematic' no está configurada.");
+
+            // Registra el Data Source de PostgreSQL usando la cadena correcta
+            services.AddNpgsqlDataSource(connectionString, dataSourceBuilder =>
+            {
+                // Le enseñamos a Npgsql cómo traducir los records de C# a los tipos de Postgres
+                dataSourceBuilder.MapComposite<TG.Persistence.Repositories.TypeGeofenceEventBatch>("public.type_geofence_event_batch");
+            });
+
             // Configurar RabbitMQ desde la biblioteca compartida
             services.Configure<RabbitMQSettings>(options => configuration.GetSection("RabbitMQ").Bind(options));
             services.AddSingleton<RabbitMQService>();

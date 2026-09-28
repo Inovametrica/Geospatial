@@ -259,7 +259,7 @@ namespace TG.Domain.Device
                 var parts = entry.Split('|');
                 if (parts.Length != 3) continue;
 
-                if (!long.TryParse(parts[0], out var geofenceId) || !DateTime.TryParse(parts[2], out var entryTimeUtc))
+                if (!long.TryParse(parts[0], out var geofenceId) || !DateTime.TryParse(parts[2], null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var entryTimeUtc))
                     continue;
 
                 // Usamos el mánager para extraer la geocerca de la memoria
